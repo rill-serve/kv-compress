@@ -1,9 +1,15 @@
 # kv-compression
 
-Lossless (bit-exact) KV-cache compression. Extracted from
-`rill-sim/rill_sim/research/kv_compress.py` after a measured method grid on
-Qwen3-8B (36L × 8 KV heads × d=128, book + code text, S = 1024..32768,
-`results/compress2_{book,code}_8b.json`).
+Lossless + lossy (rate–distortion) KV-cache compression. Extracted from
+`rill-sim` (`rill_sim/research/kv_compress.py`, `kv_rd.py`, `kv_sparse.py`)
+after measured method grids on Qwen3-8B (36L × 8 KV heads × d=128, book +
+code text; `results/compress2_*.json`, `rd_*.json`, `tiered_*.json`,
+`repl5_book_8b.json` in rill-sim).
+
+Distortion metrics in the tables: teacher-forced window evaluation —
+prefill P clean tokens, corrupt the cache, forward a W=1024 window; KL in
+nats between clean/corrupt next-token distributions, ΔNLL on real text.
+All end-to-end numbers validated with actual generation (swap-in decode).
 
 ## The optimal method: `chan+planes`
 
@@ -58,6 +64,8 @@ working as the cache grows.
 
 ## Usage
 
+### Lossless (default codec)
+
 ```python
 import torch
 from kv_compression import bf16_bits, bits_bf16, encode, decode, BEST_METHOD
@@ -72,19 +80,95 @@ back = decode(streams, bits.shape, BEST_METHOD)
 k_restored = bits_bf16(back, k[0]).unsqueeze(0)   # bit-exact
 ```
 
-Compare all methods (with bit-exact verification):
+Compare all lossless methods (with bit-exact verification):
 
 ```python
 from kv_compression import evaluate_tensor
 report = evaluate_tensor(bits)   # {"chan+planes": {"bps": ..., "ok": True}, ...}
 ```
 
-Throughput benchmark over a captured cache:
+### Lossy (optional codecs)
+
+Uniform per-channel quantization — no model signal needed:
+
+```python
+from kv_compression.lossy import bits_to_f32, f32_to_bits, encode_quant, decode_quant
+
+x = bits_to_f32(bf16_bits(k[0]))            # [H, S, D] float32 (exact)
+streams = encode_quant(x, bits=6, group="chan")
+xq = decode_quant(streams)                  # float32, ~5.2 bps, KL 0.013
+k_q = bits_bf16(f32_to_bits(xq), k[0])      # back to bf16 torch
+```
+
+Importance-tiered quantization + eviction — the best measured rate–distortion
+(requires a per-token importance score, e.g. cumulative attention mass over
+an observation window, SnapKV-style; the caller computes it from the model):
+
+```python
+from kv_compression.lossy import encode_tiered, decode_tiered
+
+streams = encode_tiered(x, token_importance, tiers="balanced")
+x_kept, kept_idx = decode_tiered(streams)   # [H, S_kept, D] + original positions
+# materialize cache holes from kept_idx (sorted original token positions)
+```
+
+Tier maps (cumulative fraction by importance rank → bits, 0 = evict):
+
+| name        | map                                   | measured (book) |
+|-------------|---------------------------------------|-----------------|
+| aggressive  | 1%→8b, 10%→4b, rest evicted           | 0.38 bps (×42), KL 0.044 |
+| balanced    | 5%→8b, 25%→6b, rest evicted           | 1.28 bps (×12.5), KL 0.02 |
+| quality     | 10%→8b, 50%→6b, rest 4b               | 4.10 bps (×3.9), KL 0.002 |
+| L-shape     | 1%→8b, 10%→6b, 25%→4b, 50%→2b, rest evicted | 1.39 bps, KL 0.06 |
+
+Both report rate+RMSE together:
+
+```python
+from kv_compression.lossy import evaluate_tensor_lossy
+report = evaluate_tensor_lossy(x, token_importance)
+# {"quant4b-chan": {"bps":..., "rel_rmse":...}, "tiered/balanced": {"bps":..., "keep":..., "rel_rmse":...}, ...}
+```
+
+### Throughput
 
 ```python
 from kv_compression.bench import bench_tensors
 rows = bench_tensors([("0.k", bits_k), ("0.v", bits_v)])
 ```
+
+## Lossy: measured rate–distortion (Qwen3-8B, book text)
+
+| method                      | rate bps | compression | KL    | ΔNLL   |
+|-----------------------------|----------|-------------|-------|--------|
+| lossless chan+planes        | 11.13    | ×1.4        | 0     | 0      |
+| tiered/quality              | 4.10     | ×3.9        | 0.002 | ≈0     |
+| mixed per-layer (greedy)    | ~5.5     | ×2.9        | 0.010 | +0.005 |
+| tiered/balanced (online)    | 1.28     | ×12.5       | 0.030 | -0.008 (e2e) |
+| tiered/aggressive           | 0.38     | ×42         | 0.044 | +0.039 |
+| uniform 6b chan             | 5.19     | ×3.1        | 0.013 | +0.021 |
+| uniform 4b chan             | 3.50     | ×4.6        | 0.279 | +0.257 |
+| uniform 3b chan             | 2.36     | ×6.8        | 1.111 | +1.008 |
+| evict keep-10% (bf16)       | 1.60     | ×10         | 0.044 | —      |
+| recency / random evict      | —        | —           | >1.2  | collapse |
+
+Findings:
+
+1. **Attention mass is extremely concentrated** (importance entropy
+   ~5.3 of 12.8 bits at P=7168): tiered eviction+quantization dominates
+   everything else at low rate — 0.38 bps (×42) at KL 0.04.
+2. **Per-channel (`chan`) granularity ≫ `head` ≫ `tensor`** at low bits
+   (2-bit: KL 0.96 vs 5.8 vs 9.1). Channel scales along S are the right
+   grouping for KV tensors.
+3. **K is more sensitive than V** at low bits; mixed per-layer bit
+   allocation gains ~2× rate at equal KL vs uniform.
+4. **Importance must come from attention** — recency/random eviction
+   collapse (KL > 1.2) even at keep-50%. Online importance (last W prompt
+   tokens as queries) tracks oracle importance closely (0.085 vs 0.044 KL
+   at 0.38 bps).
+5. **VQ/PQ was a measured negative result** (see rill-sim `kv_vq.py`):
+   codebook methods underperform simple per-channel quantization on KV.
+6. End-to-end generation validation (`repl5`): tiered/balanced online at
+   1.28 bps swaps in at 2.2 GB/s (≈14.7k tok/s) with ΔNLL ≈ 0.
 
 ## Install / test
 
@@ -100,7 +184,12 @@ Core codec needs only numpy + zstandard; torch is an optional extra used by
 
 - `kv_compression/bits.py` — bf16 ↔ uint16 bit plumbing (bijective, NaN-safe),
   monotone key, zigzag, delta/xor transforms (reference methods).
-- `kv_compression/codec.py` — per-method `encode`/`decode`, `evaluate_tensor`,
-  `delta_entropy_bits` (analytic floor).
+- `kv_compression/codec.py` — per-method lossless `encode`/`decode`,
+  `evaluate_tensor`, `delta_entropy_bits` (analytic floor).
+- `kv_compression/lossy.py` — lossy codecs: uniform quantization
+  (chan/head/tok/tensor granularity) and importance-tiered quantization +
+  eviction, plus the bf16↔f32 bridge and rate/RMSE evaluation.
 - `kv_compression/bench.py` — throughput benchmark.
-- `tests/test_codec.py` — round-trip incl. special values, behaviour, bench smoke.
+- `tests/` — round-trip incl. special values, tier layout, bf16 bridge vs
+  torch, behaviour, bench smoke (37 tests). The lossy core is verified
+  bit-exact against the original rill-sim torch implementation.
