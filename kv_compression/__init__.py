@@ -1,14 +1,12 @@
-"""Lossless (bit-exact) KV-cache compression.
+"""KV-cache compression: lossless (bit-exact) + optional lossy codecs.
 
-Extracted from `rill-sim/rill_sim/research/kv_compress.py` after a measured
-method grid on Qwen3-8B (book + code text, S = 1024..32768). The winner is
-``chan+planes``:
+The lossless codec (``chan+planes``, see README) was selected from a
+measured method grid on Qwen3-8B (book + code text, S = 1024..32768). It
+wins at ~×1.4–1.5 with decode as cheap as raw zstd.
 
-    1. reinterpret bf16 K/V as uint16 bit patterns (bijective, NaN-safe);
-    2. transpose to channel-major (H, S, D) -> (H, D, S) so consecutive
-       sequence positions of one channel are adjacent;
-    3. split into low/high byte planes (mantissa noise vs exponent structure);
-    4. compress each plane independently with zstd.
+Optional lossy codecs live in :mod:`kv_compression.lossy` (uniform
+per-channel quantization; importance-tiered quantization + eviction,
+the best measured rate–distortion: 0.38–4.1 bps at KL 0.002–0.04).
 
 Measured bits/element (bf16 reference = 16.000), Qwen3-8B, zstd level 3:
 
@@ -29,6 +27,9 @@ Measured bits/element (bf16 reference = 16.000), Qwen3-8B, zstd level 3:
 no delta/xor representation can do meaningfully better with this bit layout.
 Decode is as cheap as raw zstd (1.19 vs 1.22 GB/s serial; ~5-10 GB/s with a
 thread pool), because plane merge + transpose vectorize for free.
+
+See README.md for the full measured tables, the lossy rate-distortion
+results, and usage examples.
 """
 
 from kv_compression.bits import (

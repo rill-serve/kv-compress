@@ -11,6 +11,14 @@ prefill P clean tokens, corrupt the cache, forward a W=1024 window; KL in
 nats between clean/corrupt next-token distributions, ΔNLL on real text.
 All end-to-end numbers validated with actual generation (swap-in decode).
 
+## At a glance
+
+| need | codec | rate (bps) | distortion |
+|------|-------|-----------|------------|
+| bit-exact restore | `encode(bits, "chan+planes")` | 10.9–11.1 (×1.4–1.5) | none |
+| simple, no model signal | `lossy.encode_quant(x, bits∈{4,6,8}, "chan")` | 3.5–5.2 (×3–4.6) | KL 0.01–0.28 |
+| best rate–distortion | `lossy.encode_tiered(x, imp, tiers∈{aggressive,balanced,quality})` | 0.38–4.1 (×3.9–42) | KL 0.002–0.04 |
+
 ## The optimal method: `chan+planes`
 
 ```text
@@ -56,8 +64,8 @@ Findings:
    i.e. ~69k tok/s for an 8B model's 147 KB/token cache). Encode is
    0.18 GB/s serial, ~4.4 GB/s with a 32-thread pool.
 5. **zstd level 19** reaches 10.63 bps (×1.51) but encodes ~100× slower
-   (0.03 GB/s) — level 3 is the practical optimum. lz4 is *worse* than
-   nothing interesting (13.03 bps).
+   (0.03 GB/s) — level 3 is the practical optimum. lz4 compresses worse
+   than zstd here (13.03 bps) and offers no advantage worth the ratio.
 
 Ratios are stationary in S (×1.43 at 1k → ×1.47 at 32k): the method keeps
 working as the cache grows.
@@ -109,7 +117,8 @@ from kv_compression.lossy import encode_tiered, decode_tiered
 
 streams = encode_tiered(x, token_importance, tiers="balanced")
 x_kept, kept_idx = decode_tiered(streams)   # [H, S_kept, D] + original positions
-# materialize cache holes from kept_idx (sorted original token positions)
+# column i of x_kept is original token kept_idx[i]; scatter back into a
+# holed cache (kept_idx is grouped by tier, not globally sorted)
 ```
 
 Tier maps (cumulative fraction by importance rank → bits, 0 = evict):

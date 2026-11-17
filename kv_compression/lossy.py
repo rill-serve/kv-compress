@@ -223,8 +223,10 @@ def decode_tiered(streams: list[bytes]):
     """Inverse of :func:`encode_tiered`.
 
     Returns ``(x_kept [H, S_kept, D] float32, kept_idx [S_kept] int32)`` —
-    evicted positions are gone; the caller materializes cache holes from
-    ``kept_idx`` (original token positions, sorted ascending).
+    evicted positions are gone. Column ``i`` of ``x_kept`` is the original
+    token ``kept_idx[i]``; the columns are grouped by tier (ascending
+    bits), not globally sorted. The caller materializes cache holes by
+    scattering columns back to ``kept_idx`` positions.
     """
     head = json.loads(streams[0])
     assert head["codec"] == "tiered"
