@@ -95,6 +95,138 @@ from kv_compression import evaluate_tensor
 report = evaluate_tensor(bits)   # {"chan+planes": {"bps": ..., "ok": True}, ...}
 ```
 
+### Cross-request dedup (shared-prefix block store)
+
+`kv_compression.dedup` deduplicates whole batches of requests before
+compression. KV columns of two requests are bit-equal iff their token
+prefixes from position 0 are equal (layer >= 1 K/V are contextualized,
+and K carries RoPE position) — so dedup is *prefix-only*: the
+storage-side analogue of prefix caching (vLLM APC / RadixAttention),
+not general content dedup.
+
+```python
+from kv_compression import Request, encode_batch, decode_batch, batch_report
+
+reqs = [Request(token_ids, {f"{l}.{kv}": bf16_bits(cache[l][kv][0])
+                             for l in layers for kv in "kv"})
+        for ...]                     # same tensor names for every request
+streams = encode_batch(reqs, block_tokens=64)   # unique blocks + per-request refs
+back = decode_batch(streams)                    # bit-exact per request
+print(batch_report(streams))  # {"dedup_frac": ..., "bps_vs_raw": ..., ...}
+```
+
+Design points (all measured-in-the-design, not tunables):
+
+1. **Keys are a chained token-id hash** (`key_i = sha256(key_{i-1} ||
+   tokens[iB:(i+1)B])`), *not* a hash of KV bytes: recomputing the same
+   prefix in a different batch shape can yield non-bit-exact KV (GEMM
+   reduction order); token-keying still hits, and first-writer-wins
+   keeps decode bit-exact. A stored 64-bit content checksum only flags
+   true collisions (`on_collision="ignore"|"warn"|"error"`).
+2. **Unique blocks are compressed independently** (default
+   `chan+planes`), so one block fetches in O(block) — trading a little
+   ratio for random access vs one concatenated stream.
+3. **Partial tails are their own identity**: a 36-token tail and a
+   64-token block over the same start never cross-dedup.
+4. `BlockStore` is the serving-side object: `put_request` compresses
+   and stores only missing blocks, `get_request` reassembles (None if
+   any block misses), `missing_keys` drives partial fetch, and
+   `BlockStore.from_archive` reloads a persisted batch.
+5. **Dedup is lossless-layer only**: tiered importance is per-request
+   (each suffix attends the shared prefix differently), so a shared
+   compressed block would force a shared tier decision.
+
+Scale: 4k shared prefix + 1k private suffix, 5 requests, Qwen3-8B
+(147 KB/token) is ~3.6 GB -> ~1.3 GB; a multi-turn conversation stores
+only its new tokens per round.
+
+### Transmission (internet + data center, one stack)
+
+`kv_compression.transport` picks the codec operating point per transfer
+— the measured rate–distortion table becomes a network rate controller:
+
+```python
+from kv_compression import choose_plan
+
+plan = choose_plan(8192, bandwidth_bits_per_s=50e6, deadline_s=10.0, rtt_s=0.1)
+# internet:  -> tiered/aggressive (0.38 bps), feasible, slack 5.3 s
+# 100 Gbps   -> exact lossless pipelined; tight SLO -> tiered/quality
+```
+
+Serial compression is a net loss above ~35 Gbps (encoder 4.4 GB/s < line
+rate), so the model also prices the pipelined regime (wire time + one
+block of codec latency, blocks streaming out during prefill).
+
+`kv_compression.wire` is the streamable side of the same block structure:
+
+* **frames** — one self-contained record per (block, tensor); resumable
+  at frame granularity, orderable block-major (internet: dedup/
+  resume-friendly) or name-major (datacenter: layer-pipelined with
+  prefill);
+* **receiver state + reconcile (KV rsync)** — `WireReceiver` keeps a
+  far-side `BlockStore`; the sender asks `have_keys()` and streams only
+  missing blocks, so a second request sharing a prefix (or a multi-turn
+  round) transfers only its new tokens;
+* **manifest** declares per-request block refs, so the receiver knows
+  exactly when each request is whole (`ready_requests()`).
+
+```python
+from kv_compression import Request, WireReceiver, build_manifest, stream_frames
+
+manifest, store = build_manifest(requests, block_tokens=64)   # sender
+rx = WireReceiver(); rx.accept_manifest(manifest)             # receiver
+for frame in stream_frames(store, receiver_keys=rx.have_keys()):
+    ...                                                        # wire
+    rx.accept_frame(frame)
+tensors = rx.take_request(0, token_ids)                       # bit-exact
+```
+
+`PROFILES` holds regime starting points (internet: 64-token blocks,
+block-major, reconcile; datacenter: 256-token blocks, name-major,
+pipelined). Dropped-mid-transfer frames re-arrive idempotently
+(first-writer-wins, dup-ignored); `verify=True` decompresses and
+re-hashes every frame against its checksum.
+
+### KVConnector extension (no vLLM dependency)
+
+`kv_compression.connector` mirrors the *shape* of vLLM's
+`KVConnectorBase_V1` hooks as a standalone extension point — it never
+imports vLLM; an engine adapter (vLLM, SGLang, custom) just binds
+methods. Transport is the `KVLink` port (reliable ordered messages:
+TCP/QUIC-stream shaped); `MemoryLink` is the in-process pair for tests
+and simulation, and the exchange is pump-driven so it drops into any
+event loop:
+
+```python
+from kv_compression import KVConnector, MemoryLink, Request, pump_until
+
+a, b = MemoryLink.pair()
+tx = KVConnector(a, profile="datacenter", bandwidth_bits_per_s=100e9, deadline_s=0.2)
+rx = KVConnector(b, profile="datacenter")
+
+tx.save(Request(token_ids, tensors))   # prefill side, after prefill
+tx.flush()                              # chooses the codec point (choose_plan)
+pump_until(tx, rx)                      # MANIFEST -> HAVE -> FRAME* -> READY
+
+hit = rx.lookup(token_ids)              # external hits before committing
+got = rx.load(0, token_ids)             # bit-exact tensors
+```
+
+Receiver and sender keep their block stores across transfers, so a
+second flush sharing a prefix transmits only missing blocks (the
+receiver's HAVE reply is the reconcile step); after a dropped
+connection, re-`save` + `flush` resumes incrementally. The operating
+point per flush comes from `choose_plan`; when the plan wants a lossy
+tier not yet wire-implemented, `last_plan["clamped"]` records the
+downgrade to the best exact codec. Senders keep a persistent store per
+codec point, so warm flushes re-encode nothing; `TCPLink` is the socket
+transport (Nagle off, pump-driven non-blocking I/O).
+
+`benchmarks/bench_wire_link.py` compares raw page transfer
+(vLLM-connector representation: bytes on wire = cache bytes) against
+this wire on a real TCP loopback link — cold and dedup-warm — with
+projected times at 50 Mbps / 25 Gbps from the measured wire bytes.
+
 ### Lossy (optional codecs)
 
 Uniform per-channel quantization — no model signal needed:
@@ -198,7 +330,22 @@ Core codec needs only numpy + zstandard; torch is an optional extra used by
 - `kv_compression/lossy.py` — lossy codecs: uniform quantization
   (chan/head/tok/tensor granularity) and importance-tiered quantization +
   eviction, plus the bf16↔f32 bridge and rate/RMSE evaluation.
+- `kv_compression/dedup.py` — cross-request prefix dedup: token-hash-chain
+  block keys, `BlockStore`, batch archives (`encode_batch`/`decode_batch`/
+  `batch_report`).
+- `kv_compression/transport.py` — transmission planner: measured RD
+  candidates vs bandwidth/deadline time model (serial + pipelined),
+  `choose_plan`, internet/datacenter `PROFILES`.
+- `kv_compression/wire.py` — streamable frames: `build_manifest`,
+  `stream_frames` (block/name-major, reconcile), `WireReceiver`.
+- `kv_compression/connector.py` — `KVConnector` extension endpoint
+  (vLLM-shaped hooks, no vLLM import), `KVLink`/`MemoryLink`/`TCPLink`
+  transport ports, pump-driven `MANIFEST→HAVE→FRAME*→READY` exchange,
+  persistent sender stores.
+- `benchmarks/bench_wire_link.py` — raw (vLLM-style) vs compressed wire
+  on a real TCP link, cold + dedup-warm, with link-rate projections.
 - `kv_compression/bench.py` — throughput benchmark.
 - `tests/` — round-trip incl. special values, tier layout, bf16 bridge vs
-  torch, behaviour, bench smoke (37 tests). The lossy core is verified
-  bit-exact against the original rill-sim torch implementation.
+  torch, behaviour, bench smoke, prefix dedup, planner + wire protocol,
+  connector exchange (91 tests). The lossy core is verified bit-exact
+  against the original rill-sim torch implementation.
